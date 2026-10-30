@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # dso-file-name-anonymizer
 Renames files in a directory based on a consistent hashing algorithm, providing a one-way anonymization of file names to prevent information leakage based on naming conventions. - Focused on Tools for sanitizing and obfuscating sensitive data within text files and structured data formats
 
