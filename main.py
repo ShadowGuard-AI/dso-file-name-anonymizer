@@ -1,5 +1,7 @@
 import os
 import hashlib
+import hmac
+import re
 import argparse
 import logging
 import sys
@@ -20,7 +22,7 @@ def setup_argparse() -> argparse.ArgumentParser:
         argparse.ArgumentParser: The configured argument parser.
     """
     parser = argparse.ArgumentParser(
-        description="Anonymizes file names in a directory using a consistent hashing algorithm."
+        description="Anonymizes file names in a directory using a keyed hash (HMAC) under an operator secret."
     )
     parser.add_argument(
         "directory",
@@ -39,6 +41,12 @@ def setup_argparse() -> argparse.ArgumentParser:
         type=str,
         default="anonymized_",
         help="The prefix to add to the anonymized file names (default: anonymized_)."
+    )
+    parser.add_argument(
+        "--key",
+        type=str,
+        default=None,
+        help="Secret key for the keyed hash. If not set, the DSO_FILE_NAME_ANONYMIZER_KEY environment variable is used. A key is required."
     )
     parser.add_argument(
         "--dry-run",
@@ -73,22 +81,40 @@ def is_valid_directory(directory: str) -> bool:
     return True
 
 
-def anonymize_file_name(file_name: str, algorithm: str, prefix: str) -> str:
+def is_already_anonymized(file_name: str, algorithm: str, prefix: str) -> bool:
     """
-    Anonymizes a file name using the specified hashing algorithm.
+    Checks whether a file name already has this tool's anonymized shape:
+    the prefix followed by a hex digest of the length the chosen
+    algorithm produces, plus the kept extension.
+    """
+    stem, _extension = os.path.splitext(file_name)
+    if not stem.startswith(prefix):
+        return False
+    digest_hex = stem[len(prefix):]
+    digest_length = hashlib.new(algorithm).digest_size * 2
+    return re.fullmatch(r"[0-9a-f]{%d}" % digest_length, digest_hex) is not None
+
+
+def anonymize_file_name(file_name: str, algorithm: str, prefix: str, key: str) -> str:
+    """
+    Anonymizes a file name using a keyed hash (HMAC) under an operator
+    secret. With the default algorithm this is HMAC-SHA256.
 
     Args:
         file_name (str): The name of the file to anonymize.
         algorithm (str): The hashing algorithm to use.
         prefix (str): The prefix to add to the anonymized file name.
+        key (str): The operator secret the hash is keyed with.
 
     Returns:
         str: The anonymized file name.
     """
     try:
-        # Hash the file name
-        hash_object = hashlib.new(algorithm, file_name.encode('utf-8'))
-        hashed_name = hash_object.hexdigest()
+        # Hash the file name with a keyed HMAC so that only the key
+        # holder can check a candidate name against its anonymized form.
+        hashed_name = hmac.new(
+            key.encode('utf-8'), file_name.encode('utf-8'), getattr(hashlib, algorithm)
+        ).hexdigest()
 
         # Get the file extension
         file_extension = os.path.splitext(file_name)[1]
@@ -101,7 +127,7 @@ def anonymize_file_name(file_name: str, algorithm: str, prefix: str) -> str:
         return None
 
 
-def process_directory(directory: str, algorithm: str, prefix: str, dry_run: bool) -> None:
+def process_directory(directory: str, algorithm: str, prefix: str, dry_run: bool, key: str) -> int:
     """
     Processes all files in the specified directory, anonymizing their names.
 
@@ -110,32 +136,78 @@ def process_directory(directory: str, algorithm: str, prefix: str, dry_run: bool
         algorithm (str): The hashing algorithm to use.
         prefix (str): The prefix to add to the anonymized file names.
         dry_run (bool): Whether to perform a dry run without renaming files.
+        key (str): The operator secret the hash is keyed with.
+
+    Returns:
+        int: Exit code. 1 when any rename fails, when a rename is refused
+        because its target name already exists, or when the directory
+        holds nothing to rename; 0 otherwise.
     """
+    renamed = 0
+    failed = 0
+    skipped = 0
+    collisions = 0
     try:
         if not is_valid_directory(directory):
-            return
+            return 1
 
-        for file_name in os.listdir(directory):
+        file_names = [
+            name for name in os.listdir(directory)
+            if os.path.isfile(os.path.join(directory, name))
+        ]
+
+        if not file_names:
+            logging.error(f"Directory '{directory}' holds nothing to rename.")
+            logging.info(f"Done. Renamed: {renamed}, Failed: {failed}, Skipped: {skipped}")
+            return 1
+
+        for file_name in file_names:
             file_path = os.path.join(directory, file_name)
 
-            if os.path.isfile(file_path):
-                anonymized_name = anonymize_file_name(file_name, algorithm, prefix)
+            if is_already_anonymized(file_name, algorithm, prefix):
+                skipped += 1
+                logging.info(f"Skipping '{file_name}': already in anonymized form.")
+                continue
 
-                if anonymized_name:
-                    anonymized_path = os.path.join(directory, anonymized_name)
+            anonymized_name = anonymize_file_name(file_name, algorithm, prefix, key)
 
-                    if dry_run:
-                        logging.info(f"[Dry Run] Renaming '{file_name}' to '{anonymized_name}'")
-                    else:
-                        try:
-                            os.rename(file_path, anonymized_path)
-                            logging.info(f"Renamed '{file_name}' to '{anonymized_name}'")
-                        except OSError as e:
-                            logging.error(f"Error renaming '{file_name}' to '{anonymized_name}': {e}")
-                        except Exception as e:
-                            logging.error(f"Unexpected error renaming '{file_name}' to '{anonymized_name}': {e}")
+            if not anonymized_name:
+                failed += 1
+                continue
+
+            anonymized_path = os.path.join(directory, anonymized_name)
+
+            if os.path.exists(anonymized_path):
+                skipped += 1
+                collisions += 1
+                logging.error(
+                    f"Refusing to rename '{file_name}' to '{anonymized_name}': "
+                    "the target name already exists and will not be overwritten."
+                )
+                continue
+
+            if dry_run:
+                renamed += 1
+                logging.info(f"[Dry Run] Renaming '{file_name}' to '{anonymized_name}'")
+            else:
+                try:
+                    os.rename(file_path, anonymized_path)
+                    renamed += 1
+                    logging.info(f"Renamed '{file_name}' to '{anonymized_name}'")
+                except OSError as e:
+                    failed += 1
+                    logging.error(f"Error renaming '{file_name}' to '{anonymized_name}': {e}")
+                except Exception as e:
+                    failed += 1
+                    logging.error(f"Unexpected error renaming '{file_name}' to '{anonymized_name}': {e}")
     except Exception as e:
         logging.error(f"Error processing directory '{directory}': {e}")
+        failed += 1
+
+    logging.info(f"Done. Renamed: {renamed}, Failed: {failed}, Skipped: {skipped}")
+    if failed > 0 or collisions > 0 or renamed == 0:
+        return 1
+    return 0
 
 
 def main() -> int:
@@ -157,8 +229,17 @@ def main() -> int:
     if not is_valid_directory(args.directory):
         return 1
 
-    process_directory(args.directory, args.algorithm, args.prefix, args.dry_run)
-    return 0
+    key = args.key or os.environ.get("DSO_FILE_NAME_ANONYMIZER_KEY")
+    if not key:
+        logging.error(
+            "A key is required: supply --key or set the "
+            "DSO_FILE_NAME_ANONYMIZER_KEY environment variable. "
+            "Without a key the anonymized names would be reversible "
+            "by anyone with a candidate list, so nothing was renamed."
+        )
+        return 1
+
+    return process_directory(args.directory, args.algorithm, args.prefix, args.dry_run, key)
 
 
 if __name__ == "__main__":
@@ -166,14 +247,16 @@ if __name__ == "__main__":
 
 
 # Usage Examples:
-# 1. Anonymize files in a directory using the default settings:
-#    python main.py /path/to/directory
+# 1. Anonymize files in a directory using the default settings.
+#    A key is required, either as an option or as an environment variable:
+#    python main.py /path/to/directory --key YOUR_SECRET
+#    DSO_FILE_NAME_ANONYMIZER_KEY=YOUR_SECRET python main.py /path/to/directory
 #
 # 2. Anonymize files using SHA-1 hashing and a custom prefix:
-#    python main.py /path/to/directory --algorithm sha1 --prefix custom_
+#    python main.py /path/to/directory --algorithm sha1 --prefix custom_ --key YOUR_SECRET
 #
 # 3. Perform a dry run without renaming files:
-#    python main.py /path/to/directory --dry-run
+#    python main.py /path/to/directory --dry-run --key YOUR_SECRET
 #
 # 4. Specify a log file:
-#    python main.py /path/to/directory --log-file anonymizer.log
+#    python main.py /path/to/directory --log-file anonymizer.log --key YOUR_SECRET
