@@ -112,11 +112,18 @@ def anonymize_file_name(file_name: str, algorithm: str, prefix: str, key: str) -
     try:
         # Hash the file name with a keyed HMAC so that only the key
         # holder can check a candidate name against its anonymized form.
+        # The hash covers the name only, never the contents, and it is
+        # deterministic under one key and algorithm: the same original
+        # name always lands on the same anonymized name, which is what
+        # makes candidate checking possible at all.
         hashed_name = hmac.new(
             key.encode('utf-8'), file_name.encode('utf-8'), getattr(hashlib, algorithm)
         ).hexdigest()
 
-        # Get the file extension
+        # The extension survives in the clear by design, so the file type
+        # is still public information after a run. splitext keeps only the
+        # last suffix: archive.tar.gz comes out as a hash plus .gz, and
+        # the tar part of its identity is hashed away with the stem.
         file_extension = os.path.splitext(file_name)[1]
 
         # Construct the anonymized file name
@@ -151,6 +158,10 @@ def process_directory(directory: str, algorithm: str, prefix: str, dry_run: bool
         if not is_valid_directory(directory):
             return 1
 
+        # Only the top level of the directory is processed. Subdirectories
+        # are not entered and their files keep their original names, which
+        # a reader of main would not guess from the word directory alone:
+        # I verified a nested file comes through a successful run untouched.
         file_names = [
             name for name in os.listdir(directory)
             if os.path.isfile(os.path.join(directory, name))
@@ -205,6 +216,10 @@ def process_directory(directory: str, algorithm: str, prefix: str, dry_run: bool
         failed += 1
 
     logging.info(f"Done. Renamed: {renamed}, Failed: {failed}, Skipped: {skipped}")
+    # A run over a directory where every file is already anonymized
+    # renames nothing and returns 1 here, even though the directory is in
+    # exactly the state the tool exists to produce. Skips are counted in
+    # the summary but do not soften that rule.
     if failed > 0 or collisions > 0 or renamed == 0:
         return 1
     return 0
